@@ -56,14 +56,6 @@ User Query
 
 ---
 
-## 📐 Design Philosophy: Why "Basic RAG"?
-
-*A note on architecture:* This platform purposefully uses an optimized **Basic RAG** pipeline rather than an **Agentic RAG** (Query Rewriting / Conversational Memory) architecture.
-
-**Why?** Because SecRAG is fundamentally a **Lookup Engine**. When dealing with structured security data, users require deterministic speed and precision. Adding an Agentic layer requires an additional LLM inference cycle *before* search execution, fundamentally doubling latency. By relying on rigorous **RRF + Cross-Encoding**, SecRAG achieves absolute search precision in ~5 seconds on local hardware without sacrificing user experience.
-
----
-
 ## 🔧 Tech Stack
 
 | Component | Technology |
@@ -133,18 +125,13 @@ streamlit run app.py
 
 ---
 
-## 🔒 Security & Privacy Guarantees
 
-- **No API Keys:** Runs 100% locally via Ollama. No cloud provider accounts required.
-- **Strict Amnesia Prompts:** The System Prompt aggressively forces the LLM to deny answers if the exact mitigation is not listed in the retrieved contexts, ensuring zero hallucinations.
-- **Localhost Bound:** The FastAPI backend is bound solely to `127.0.0.1`, safely isolated from your exposed network.
-- **Input Sanitization:** Guardrails drop known prompt injection vectors (`"Ignore previous instructions"`).
 
 ---
 
 <div align="center">
 
-Built with ❤️ for the security community.
+
 
 *SecRAG — Defending systems through rigorous, verifiable intelligence.*
 
