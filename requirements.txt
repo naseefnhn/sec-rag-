@@ -13,8 +13,9 @@ markdown
 pyyaml
 langchain-text-splitters
 langchain-core
-google-generativeai
+ollama
 httpx>=0.25.0
 nest-asyncio>=1.5.0
 fastapi
 uvicorn
+rank-bm25>=0.2.2

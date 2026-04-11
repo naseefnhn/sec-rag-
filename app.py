@@ -2,13 +2,11 @@ import streamlit as st
 import os
 import yaml
 import requests
-import google.generativeai as genai
+import ollama
+import re
 from dotenv import load_dotenv
 
 load_dotenv()
-
-# Configure Gemini API once at module level
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
 # Page Config
 st.set_page_config(page_title="SecRAG Intelligence", page_icon="🛡️", layout="wide")
@@ -19,6 +17,38 @@ def load_config():
         return yaml.safe_load(f)
 
 config = load_config()
+
+
+# ========================================
+# OLLAMA LLM HELPER
+# ========================================
+
+def call_ollama(system_prompt: str, user_prompt: str, temperature: float = 0.4, max_tokens: int = 4000) -> str:
+    """
+    Unified Ollama LLM call with system prompt support.
+    """
+    try:
+        response = ollama.chat(
+            model=config["app"]["model"],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            options={
+                "temperature": temperature,
+                "num_predict": max_tokens,
+                "num_ctx": config.get("ollama", {}).get("num_ctx", 8192)
+            }
+        )
+        
+        text = response["message"]["content"]
+        if not text or not text.strip():
+            raise ValueError("Empty response from Ollama")
+        
+        return text.strip()
+    
+    except Exception as e:
+        raise RuntimeError(f"Ollama LLM call failed: {e}")
 SERVER_URL = "http://127.0.0.1:8000"
 
 
@@ -59,24 +89,65 @@ def call_tool(endpoint: str, data: dict):
 
 
 # ========================================
-# SMART GREETING DETECTION
+# SMART QUERY ROUTING (Inverted Logic)
 # ========================================
 
-def is_simple_greeting(text: str) -> bool:
-    """Detect simple greetings (1-3 words)"""
+def is_security_query(text: str) -> bool:
+    """
+    Detect if the input is a security-related query.
+    Returns True  → route to full RAG pipeline
+    Returns False → route to direct LLM (greeting/casual)
+    
+    Inverted logic: instead of trying to detect all greetings (impossible),
+    we detect security queries (finite, well-defined vocabulary).
+    """
     text_lower = text.lower().strip()
     words = text_lower.split()
     
-    if len(words) <= 3:
-        greeting_words = ['hi', 'hello', 'hey', 'greetings', 'good morning', 
-                         'good afternoon', 'good evening', 'thanks', 'thank you']
-        
-        if any(text_lower.startswith(g) for g in greeting_words):
-            return True
-        if text_lower in greeting_words:
-            return True
+    # Any input longer than 4 words is likely a real question → RAG
+    if len(words) > 4:
+        return True
     
-    return False
+    # Security-related keywords (finite, well-defined)
+    security_keywords = [
+        # Vulnerability types
+        'vulnerability', 'exploit', 'injection', 'xss', 'csrf', 'ssrf',
+        'sql', 'sqli', 'rce', 'lfi', 'rfi', 'xxe', 'idor',
+        'overflow', 'buffer', 'heap', 'stack',
+        'deserialization', 'traversal', 'clickjacking',
+        
+        # Security concepts
+        'authentication', 'authorization', 'encryption', 'hashing',
+        'certificate', 'tls', 'ssl', 'oauth', 'jwt', 'token',
+        'session', 'cookie', 'cors', 'csp', 'firewall',
+        'sandbox', 'privilege', 'escalation',
+        
+        # Attack/defense terms  
+        'attack', 'payload', 'malware', 'ransomware', 'phishing',
+        'brute', 'denial', 'ddos', 'dos', 'mitm',
+        'pentest', 'penetration', 'scan', 'nmap', 'burp',
+        
+        # Security domains
+        'owasp', 'cve', 'cwe', 'cvss', 'mitre',
+        'security', 'secure', 'vulnerability', 'hardening',
+        'patch', 'remediation', 'mitigation',
+        
+        # Web/API terms in security context
+        'api', 'endpoint', 'header', 'request', 'response',
+        'sanitize', 'validate', 'whitelist', 'blacklist',
+        'input', 'output', 'encoding', 'escaping',
+        
+        # Tools
+        'wireshark', 'metasploit', 'sqlmap', 'nikto', 'zap',
+        'hydra', 'john', 'hashcat', 'gobuster', 'dirb',
+        
+        # General security action words
+        'protect', 'prevent', 'defend', 'harden', 'audit',
+        'breach', 'leak', 'expose', 'compromise'
+    ]
+    
+    # Check if ANY word in the input matches a security keyword
+    return any(word in security_keywords for word in words)
 
 
 def is_safe_query(query: str) -> bool:
@@ -93,36 +164,28 @@ def is_safe_query(query: str) -> bool:
     return not any(d in query_lower for d in dangerous)
 
 
-def get_greeting_response_llm(prompt: str) -> str:
+def get_casual_response(prompt: str) -> str:
     """
-    Direct LLM call for greetings - Natural & Human-like!
-    No RAG/Tools = Fast, but sounds natural
+    Direct LLM call for non-security queries (greetings, casual chat, off-topic).
+    No RAG pipeline — fast and natural.
     """
     try:
-        model = genai.GenerativeModel(
-            model_name=config["app"]["model"],
-            system_instruction="""You are SecRAG, a friendly AI security Expert.
+        system_prompt = """You are SecRAG, a friendly AI security expert.
 
-For greetings: Welcome the user warmly (2-3 sentences), introduce yourself, and ask what security topic they'd like to explore.
+Rules:
+- For greetings: Welcome the user warmly (2-3 sentences), introduce yourself, and ask what security topic they'd like to explore.
+- For thanks: Acknowledge graciously and offer continued help.
+- For off-topic questions (jokes, math, weather, etc.): Answer briefly, then gently steer back to security. Example: "That's a fun question! But I'm best at security topics — want to explore something like SQL injection or authentication?"
+- For vague security-adjacent queries: Ask the user to be more specific so you can search the knowledge base.
 
-For thanks: Acknowledge graciously and offer continued help.
+Keep responses short (2-4 sentences). Be conversational, not robotic."""
 
-Be conversational and natural, not robotic."""
-
+        return call_ollama(
+            system_prompt=system_prompt,
+            user_prompt=f"User said: '{prompt}'. Respond naturally as SecRAG.",
+            temperature=config.get("ollama", {}).get("temperature_greeting", 0.8),
+            max_tokens=300
         )
-        llm_response = model.generate_content(
-            contents=f"User said: '{prompt}'. Respond naturally as SecRAG, a security AI assistant.",
-            generation_config=genai.GenerationConfig(
-                max_output_tokens=300,
-                temperature=0.8  # Higher for natural conversation
-            )
-        )
-        
-        # Check for empty response
-        if llm_response.text and llm_response.text.strip():
-            return llm_response.text
-        else:
-            raise ValueError("Empty LLM response")
         
     except Exception as e:
         # Static fallback only if LLM completely fails
@@ -146,7 +209,7 @@ with st.sidebar:
     st.markdown("---")
 
     st.markdown("### System Info")
-    st.write("Model: Gemini")
+    st.write(f"Model: {config['app']['model']} (Ollama)")
     st.write("Vector DB: Chroma")
     st.write("Server: HTTP (persistent)")
     
@@ -182,14 +245,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### Options")
     
-    if "generate_report" not in st.session_state:
-        st.session_state.generate_report = False
-    
-    st.session_state.generate_report = st.checkbox(
-        "Generate Security Report",
-        value=st.session_state.generate_report,
-        help="Create a formatted pentest report from findings"
-    )
+
 
     if st.button("🗑️ Clear Chat"):
         st.session_state.messages = []
@@ -201,7 +257,7 @@ with st.sidebar:
 # ========================================
 
 st.title("🔒 SecRAG - Security Intelligence")
-st.caption("AI-powered security knowledge with HTTP-based MCP")
+st.caption("AI-powered security knowledge ")
 st.markdown("---")
 
 # Initialize Session
@@ -227,9 +283,9 @@ if prompt := st.chat_input("Ask about vulnerabilities, exploits, or security bes
         st.error("⚠️ Query blocked: potential prompt injection detected.")
         st.stop()
     
-    # Check server (only for non-greetings)
-    if not is_simple_greeting(prompt) and not check_server():
-        st.error("❌ Server offline. Start with: `python mcpserver.py`")
+    # Check server (only for security queries that need RAG)
+    if is_security_query(prompt) and not check_server():
+        st.error("❌ Server offline. Start with: `python server.py`")
         st.stop()
     
     # Add user message
@@ -244,21 +300,7 @@ if prompt := st.chat_input("Ask about vulnerabilities, exploits, or security bes
     
     with st.chat_message("assistant"):
         
-        if is_simple_greeting(prompt):
-            # ========================================
-            # GREETINGS - Direct LLM (No RAG, Natural!)
-            # ========================================
-            with st.spinner("💬 Thinking..."):
-                response_text = get_greeting_response_llm(prompt)
-                st.markdown(response_text)
-                
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": response_text,
-                    "type": "greeting"
-                })
-        
-        else:
+        if is_security_query(prompt):
             # ========================================
             # SECURITY QUERIES - Full RAG Pipeline
             # ========================================
@@ -284,7 +326,7 @@ if prompt := st.chat_input("Ask about vulnerabilities, exploits, or security bes
             with st.expander("📚 Retrieved Sources", expanded=False):
                 for i, chunk in enumerate(raw_chunks[:5], 1):
                     st.caption(f"**{i}. {chunk.get('source', 'Unknown')} - {chunk.get('type', 'unknown')}**")
-                    st.text(chunk.get('content', '')[:150] + "...")
+                    st.text(chunk.get('content', ''))
 
             # Tool Call 2: Rerank
             with st.spinner("🎯 Reranking results..."):
@@ -320,11 +362,7 @@ if prompt := st.chat_input("Ask about vulnerabilities, exploits, or security bes
             else:
                 report_text = report_result.get("report", "")
                 
-                if report_text:
-                    with st.expander("🧠 Analysis Context", expanded=False):
-                        st.markdown(report_text)
-
-                else:
+                if not report_text:
                     st.warning("Report was generated but is empty. Check server logs.")
         
             # Generate LLM Response
@@ -349,19 +387,28 @@ if prompt := st.chat_input("Ask about vulnerabilities, exploits, or security bes
                 # Get output mode from session state
                 output_mode = st.session_state.get("output_mode", "analysis")
                 
-                # System Prompt: Analysis Mode (Comprehensive)
-                SYSTEM_ANALYSIS_PROMPT = """You are SecRAG, an AI security analyst specializing in penetration testing and vulnerability assessment.
+                # System Prompt: Analysis Mode (Adaptive)
+                SYSTEM_ANALYSIS_PROMPT = """You are SecRAG, an AI security analyst.
 
-CRITICAL: Only use information from the provided context. Do NOT add information from outside the context. If the context doesn't cover a section, state that no relevant information was found.
+CRITICAL DIRECTIVE: You suffer from severe amnesia. You know absolutely nothing about cybersecurity outside of the <SECURITY_REPORT> provided to you. ZERO EXTERNAL KNOWLEDGE IS ALLOWED.
 
-Structure your response as:
-1. **Overview**: Brief explanation
-2. **Technical Details**: How it works
-3. **Testing Steps**: Step-by-step procedures
-4. **Mitigation**: Prevention/fixes
-5. **Tools**: Relevant security tools
+ANTI-HALLUCINATION RULES (CRITICAL FAILURE IF VIOLATED):
+1. If the <SECURITY_REPORT> does not explicitly list testing steps, you MUST state "No testing guidance provided." Do NOT invent steps involving Burp Suite, ZAP, or any other tool.
+2. If the <SECURITY_REPORT> does not explicitly list mitigation strategies like "Input Validation" or "CSP", do NOT invent them.
+3. Every sentence you write MUST be directly traceable to a line in the <SECURITY_REPORT>.
 
-Include only sections supported by the retrieved context. Be precise and security-focused."""
+RESPONSE STRATEGY (You MUST evaluate the user intent first):
+
+• INTENT 1: Specific Data Lookup (e.g., "XSS CVEs", "list vulnerabilities").
+  ACTION: Output ONLY a Markdown table of the findings. Do NOT include Overviews, do NOT include Testing steps, and do NOT include theory.
+
+• INTENT 2: General Concept (e.g., "Explain XSS", "What is SQLi").
+  ACTION: Output an Overview and Technical Details using ONLY the definitions inside the report.
+
+• INTENT 3: Targeted Question (e.g., "How do I fix CVE-1234").
+  ACTION: Answer directly. If the report lacks the fix, output: "The report does not contain mitigation data for this flaw."
+
+Be precise, technical, and strictly constrained to the text."""
 
                 # System Prompt: Checklist Mode (Actionable)
                 SYSTEM_CHECKLIST_PROMPT = """You are SecRAG, a senior penetration tester.
@@ -395,7 +442,7 @@ Rules:
 {prompt}
 </QUERY>
 
-Analyze the findings using only the information in the report above. Structure your response around the report's findings with technical depth and actionable mitigation strategies."""
+Analyze the findings using only the information in the report above. Adhere strictly to the System Rules regarding formatting and hallucination."""
                 else:
                     # Fallback: report failed, use raw chunks directly
                     context_prompt = f"""<CONTEXT>
@@ -410,26 +457,12 @@ Analyze the findings using only the information in the report above. Structure y
                     st.code(f"SYSTEM:\n{system_prompt}\n\nCONTEXT:\n{context_prompt}", language="text")
                 
                 try:
-                    model = genai.GenerativeModel(
-                        model_name=config["app"]["model"],
-                        system_instruction=system_prompt
+                    response_text = call_ollama(
+                        system_prompt=system_prompt,
+                        user_prompt=context_prompt,
+                        temperature=config.get("ollama", {}).get("temperature_analysis", 0.4),
+                        max_tokens=4000
                     )
-
-                    llm_response = model.generate_content(
-                        contents=context_prompt,
-                        generation_config=genai.GenerationConfig(
-                            max_output_tokens=4000,
-                            temperature=0.4
-                        )
-                    )
-                    
-                    # Check for blocked response (safety filters)
-                    if not llm_response.candidates:
-                        raise ValueError("Response blocked by safety filters. Try rephrasing your query.")
-                    
-                    response_text = llm_response.text
-                    if not response_text or not response_text.strip():
-                        raise ValueError("Empty response from Gemini LLM")
                     
                     st.markdown(response_text)
 
@@ -468,3 +501,17 @@ Analyze the findings using only the information in the report above. Structure y
                         "role": "assistant",
                         "content": fallback_response
                     })
+        
+        else:
+            # ========================================
+            # CASUAL / GREETINGS - Direct LLM (No RAG)
+            # ========================================
+            with st.spinner("💬 Thinking..."):
+                response_text = get_casual_response(prompt)
+                st.markdown(response_text)
+                
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": response_text,
+                    "type": "greeting"
+                })

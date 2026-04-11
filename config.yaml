@@ -1,15 +1,26 @@
 app:
   name: "SecRAG Intelligence Platform"
   version: "1.0.0"
-  model: "gemini-2.5-flash"
-  
+  model: "llama3.1"
+
+ollama:
+  base_url: "http://localhost:11434"
+  num_ctx: 8192
+  temperature_greeting: 0.8
+  temperature_analysis: 0.4
 
 database:
   path: "./chroma_db"
   collection_name: "security_knowledge"
   embedding_model: "BAAI/bge-base-en-v1.5"  # 768 dims, 512 tokens, English-optimized
 
-
+search:
+  bm25_index_path: "./bm25_index.pkl"  # BM25 sparse index (built by build_db.py)
+  initial_retrieval_k: 20               # Chunks pulled from EACH engine before RRF
+  rrf_k: 60                             # RRF constant (60 = default from the paper)
+  rerank_cutoff: 0.15                   # Cross-encoder minimum score (was 1.0, too aggressive)
+  rerank_top_k: 8                       # Max chunks after reranking
+  min_chunks_fallback: 3                # Minimum chunks even if all below cutoff
 
 mcp:
   server_name: "secrag-tools"

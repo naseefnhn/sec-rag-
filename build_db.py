@@ -1,5 +1,7 @@
 import os
 import requests
+import pickle
+from rank_bm25 import BM25Okapi
 from langchain_community.document_loaders import (
     UnstructuredMarkdownLoader,UnstructuredXMLLoader,
     DirectoryLoader,
@@ -498,6 +500,38 @@ class DBBuilder:
             self.collection.add(ids=ids, documents=texts, metadatas=sanitized_metadata)
 
         print(f"✓ Total documents added to collection: {len(all_chunks)}")
+
+        # ═══════════════════════════════════════════
+        # BM25 SPARSE INDEX (NEW — enables keyword search)
+        # ═══════════════════════════════════════════
+        print("\n🔍 Building BM25 sparse index...")
+        
+        corpus_texts = [doc.page_content for doc in all_chunks]
+        corpus_metadata = [doc.metadata for doc in all_chunks]
+        corpus_ids = [f"doc_{i}" for i in range(len(all_chunks))]
+        
+        # Tokenize: split each chunk into lowercase words
+        tokenized_corpus = [text.lower().split() for text in corpus_texts]
+        
+        # Build the BM25 inverted index
+        bm25 = BM25Okapi(tokenized_corpus)
+        
+        # Sanitize metadata for pickle (remove None values)
+        clean_metadata = [{k: v for k, v in m.items() if v is not None} for m in corpus_metadata]
+        
+        # Save everything as a pickle file
+        bm25_data = {
+            "bm25": bm25,
+            "corpus_texts": corpus_texts,
+            "corpus_metadata": clean_metadata,
+            "corpus_ids": corpus_ids
+        }
+        
+        bm25_path = self.config.get("search", {}).get("bm25_index_path", "./bm25_index.pkl")
+        with open(bm25_path, "wb") as f:
+            pickle.dump(bm25_data, f)
+        
+        print(f"✓ BM25 index saved to {bm25_path}: {len(corpus_texts)} documents indexed")
         
 if __name__ == "__main__":
     db_builder = DBBuilder()

@@ -6,6 +6,7 @@ from chromadb.utils import embedding_functions
 from sentence_transformers import CrossEncoder
 import yaml
 import time
+import pickle
 from datetime import datetime
 import logging
 import uvicorn
@@ -49,6 +50,28 @@ except Exception as e:
     logging.error(f"Failed to initialize reranker: {e}")
     cross_encoder = None
 
+# -------------------------------------------------
+# BM25 Sparse Index (for keyword search)
+# -------------------------------------------------
+bm25_index = None
+bm25_corpus_texts = []
+bm25_corpus_metadata = []
+bm25_corpus_ids = []
+
+try:
+    bm25_path = config.get("search", {}).get("bm25_index_path", "./bm25_index.pkl")
+    with open(bm25_path, "rb") as f:
+        bm25_data = pickle.load(f)
+    bm25_index = bm25_data["bm25"]
+    bm25_corpus_texts = bm25_data["corpus_texts"]
+    bm25_corpus_metadata = bm25_data["corpus_metadata"]
+    bm25_corpus_ids = bm25_data["corpus_ids"]
+    logging.info(f"BM25 index loaded: {len(bm25_corpus_texts)} documents")
+except FileNotFoundError:
+    logging.warning("BM25 index not found. Run build_db.py to create it. Falling back to dense-only search.")
+except Exception as e:
+    logging.error(f"Failed to load BM25 index: {e}")
+
 class SearchRequest(BaseModel):
     query: str
     k: int = 10
@@ -78,21 +101,71 @@ def root():
     }
 
 # ========================================
-# TOOL 1: Search Knowledge Base
+# RRF: Reciprocal Rank Fusion
+# ========================================
+
+def reciprocal_rank_fusion(dense_results: list, bm25_results: list, k: int = 60) -> list:
+    """
+    Merge two ranked lists using Reciprocal Rank Fusion.
+    
+    For each document d appearing in any list:
+      rrf_score(d) = Σ 1/(k + rank_i)
+    
+    Documents found by BOTH engines get score-boosted.
+    k=60 is the constant from the original RRF paper.
+    """
+    scores = {}
+    
+    for rank, doc in enumerate(dense_results):
+        doc_id = doc.get("doc_id", doc["content"][:100])
+        scores[doc_id] = {"doc": doc, "score": 1.0 / (k + rank + 1)}
+    
+    for rank, doc in enumerate(bm25_results):
+        doc_id = doc.get("doc_id", doc["content"][:100])
+        if doc_id in scores:
+            # Found by BOTH engines → boost score
+            scores[doc_id]["score"] += 1.0 / (k + rank + 1)
+        else:
+            # Found ONLY by BM25
+            scores[doc_id] = {"doc": doc, "score": 1.0 / (k + rank + 1)}
+    
+    fused = sorted(scores.values(), key=lambda x: x["score"], reverse=True)
+    return [item["doc"] for item in fused]
+
+
+def _extract_chunk(content, doc_id, metadata, score):
+    """Helper: build a chunk dict from raw data."""
+    return {
+        "content": content,
+        "doc_id": doc_id,
+        "title": metadata.get("title", ""),
+        "priority": metadata.get("priority", ""),
+        "score": round(score, 3),
+        "source": metadata.get("source", "Unknown"),
+        "type": metadata.get("type", "unknown"),
+        "cve_id": metadata.get("cve_id", ""),
+        "cvss_score": metadata.get("cvss_score", 0.0),
+        "cwe_id": metadata.get("cwe_id", ""),
+        "published": metadata.get("published", "")
+    }
+
+
+# ========================================
+# TOOL 1: Hybrid Search Knowledge Base
 # ========================================
 
 @app.post("/tools/search",response_model=ToolResponse)
 def search(request: SearchRequest):
     """
-    Search the security knowledge base for vulnerabilities, best practices, or remediation steps.
-    Returns the most relevant text chunks with their metadata as JSON.
+    Hybrid search: Dense (ChromaDB) + BM25 (keyword) → RRF fusion.
+    Replaces the old source-stratified dense-only search.
     
     Args:
         query: Search query string
         k: Number of results to return (default: 10)
     
     Returns:
-        JSON string with structure: {"chunks": [{"content": str, "source": str, ...}], "query": str, "count": int}
+        JSON with fused chunks from both search engines.
     """
     try:
         if collection is None:
@@ -103,72 +176,85 @@ def search(request: SearchRequest):
             )
         
         start_time = time.time()
+        retrieval_k = config.get("search", {}).get("initial_retrieval_k", 20)
+        rrf_k = config.get("search", {}).get("rrf_k", 60)
         
-        source_types = ["OWASP", "OWASP_WSTG", "NVD", "MITRE"]
+        # ═══════════════════════════════════════
+        # PATH A: Dense search (ChromaDB) — semantic
+        # ═══════════════════════════════════════
+        # ONE global query — no source filtering.
+        # Let the best chunks from ANY source surface.
+        dense_raw = collection.query(
+            query_texts=[request.query],
+            n_results=retrieval_k
+        )
         
-        # Split the total requested results evenly across sources
-        # Example: k=20 / 4 sources = 5 results per source
-        # max(3, ...) ensures we always get at least 3 from each
-        per_source_k = max(3, request.k // len(source_types))
+        dense_results = []
+        for i in range(len(dense_raw["documents"][0])):
+            meta = dense_raw["metadatas"][0][i]
+            dense_results.append(_extract_chunk(
+                content=dense_raw["documents"][0][i],
+                doc_id=dense_raw["ids"][0][i],
+                metadata=meta,
+                score=1 - dense_raw["distances"][0][i]
+            ))
         
-        # Collect all chunks from all sources into one list
-        chunks = []
+        # ═══════════════════════════════════════
+        # PATH B: BM25 search (sparse) — keyword
+        # ═══════════════════════════════════════
+        # Finds exact matches for CVE IDs, CWE numbers, acronyms.
+        bm25_results = []
+        if bm25_index is not None:
+            tokenized_query = request.query.lower().split()
+            bm25_scores = bm25_index.get_scores(tokenized_query)
+            
+            # Get top-k indices sorted by BM25 score (highest first)
+            top_indices = sorted(
+                range(len(bm25_scores)),
+                key=lambda i: bm25_scores[i],
+                reverse=True
+            )[:retrieval_k]
+            
+            for idx in top_indices:
+                if bm25_scores[idx] > 0:  # Only include if BM25 found a match
+                    bm25_results.append(_extract_chunk(
+                        content=bm25_corpus_texts[idx],
+                        doc_id=bm25_corpus_ids[idx],
+                        metadata=bm25_corpus_metadata[idx],
+                        score=float(bm25_scores[idx])
+                    ))
+        else:
+            logger.warning("BM25 index not loaded — using dense-only search")
         
-        # Track content we've already added to avoid duplicates.
-        # set() is like a checklist — we can quickly ask 
-        # "have I seen this content before?" in O(1) time.
-        already_added_content = set()
+        # ═══════════════════════════════════════
+        # FUSION: Reciprocal Rank Fusion
+        # ═══════════════════════════════════════
+        fused_chunks = reciprocal_rank_fusion(dense_results, bm25_results, k=rrf_k)
         
-        # Search each source type independently
-        for source in source_types:
-            try:
-                # Query ChromaDB filtered to ONE source type only
-                # Example: where={"source": "OWASP"} → only OWASP docs
-                results = collection.query(
-                    query_texts=[request.query],
-                    n_results=per_source_k,
-                    where={"source": source}
-                )
-                
-                # Process each result from this source
-                for i in range(len(results["documents"][0])):
-                    content = results["documents"][0][i]
-                    
-                    # DEDUPLICATION: Due to chunk overlap during ingestion,
-                    # the same text can appear in multiple chunks.
-                    # We check the first 200 characters as a fingerprint.
-                    # If we've seen it before → skip. If new → add it.
-                    fingerprint = content[:200]
-                    if fingerprint in already_added_content:
-                        continue  # Already have this content, skip it
-                    already_added_content.add(fingerprint)
-                    
-                    # Extract all metadata stored during build_db.py ingestion
-                    metadata = results["metadatas"][0][i]
-                    chunks.append({
-                        "content": content,
-                        "title": metadata.get("title", ""),
-                        "priority": metadata.get("priority", ""),
-                        "score": round(1 - results["distances"][0][i], 3),
-                        "source": metadata.get("source", "Unknown"),
-                        "type": metadata.get("type", "unknown"),
-                        "cve_id": metadata.get("cve_id", ""),
-                        "cvss_score": metadata.get("cvss_score", 0.0),
-                        "cwe_id": metadata.get("cwe_id", ""),
-                        "published": metadata.get("published", "")
-                    })
-            except Exception:
-                # If a source type has zero matching docs, skip it
-                continue
+        # Deduplicate by content fingerprint
+        seen = set()
+        unique_chunks = []
+        for chunk in fused_chunks:
+            fp = chunk["content"][:200]
+            if fp not in seen:
+                seen.add(fp)
+                unique_chunks.append(chunk)
+        
+        # Return top-k
+        final_chunks = unique_chunks[:request.k]
         
         end_time = time.time()
+        
+        logger.info(f"Hybrid search: {len(dense_results)} dense + {len(bm25_results)} BM25 → {len(final_chunks)} fused (query: {request.query[:50]})")
         
         return ToolResponse(
             status="success",
             data={
-                "chunks": chunks,
+                "chunks": final_chunks,
                 "query": request.query,
-                "count": len(chunks),
+                "count": len(final_chunks),
+                "dense_count": len(dense_results),
+                "bm25_count": len(bm25_results),
                 "query_time": round(end_time - start_time, 3)
             }
         )
@@ -230,34 +316,29 @@ def rerank_context(request: RerankRequest):
             scored_chunk["relevance_score"] = round(float(scores[i]), 4)
             scored_chunks.append(scored_chunk)
         
+        # SCORE CUTOFF: Drop garbage chunks that the cross-encoder
+        # determined are largely irrelevant.
+        # 0.15 keeps "good-enough" chunks while filtering true garbage (negative scores).
+        # Old value was 1.0 — way too aggressive, dropped ~70% of relevant chunks.
+        RELEVANCE_CUTOFF = config.get("search", {}).get("rerank_cutoff", 0.15)
+        all_scored = scored_chunks.copy()  # Keep a copy for fallback
+        before_cutoff = len(scored_chunks)
+        scored_chunks = [c for c in scored_chunks if c["relevance_score"] >= RELEVANCE_CUTOFF]
+        dropped = before_cutoff - len(scored_chunks)
+        if dropped > 0:
+            logger.info(f"Score cutoff: dropped {dropped}/{before_cutoff} chunks below {RELEVANCE_CUTOFF}")
+        
+        # FALLBACK: Guarantee minimum chunks reach the LLM.
+        # If cutoff was too aggressive for this query, take top-N by score regardless.
+        min_chunks = config.get("search", {}).get("min_chunks_fallback", 3)
+        if len(scored_chunks) < min_chunks:
+            scored_chunks = sorted(all_scored, key=lambda x: x["relevance_score"], reverse=True)[:min_chunks]
+            logger.warning(f"Fallback: only {len(scored_chunks)} chunks above cutoff, taking top {min_chunks}")
+        
         # Sort all scored chunks from highest to lowest relevance
         scored_chunks.sort(key=lambda x: x["relevance_score"], reverse=True)
         
-        # Walk through sorted list: grab the FIRST (= best-scoring) 
-        # chunk from each unique source. Put duplicates aside.
-        already_selected_sources = set()
-        one_per_source = []       # Best chunk from each source type
-        duplicate_sources = []    # All other chunks (same source already picked)
-        
-        for chunk in scored_chunks:
-            source = chunk.get("source", "Unknown")
-            if source not in already_selected_sources:
-                # First time seeing this source → keep it
-                already_selected_sources.add(source)
-                one_per_source.append(chunk)
-            else:
-                # Source already represented → save for later
-                duplicate_sources.append(chunk)
-        
-        # Build final list: start with one-per-source picks,
-        # then fill any remaining slots with next-best by score
-        final_selection = one_per_source[:request.top_k]
-        slots_remaining = request.top_k - len(final_selection)
-        if slots_remaining > 0:
-            final_selection.extend(duplicate_sources[:slots_remaining])
-        
-        # Sort final selection by score so highest relevance shows first
-        top_chunks = sorted(final_selection, key=lambda x: x["relevance_score"], reverse=True)
+        top_chunks = scored_chunks[:request.top_k]
         
         end_time = time.time()
         
