@@ -90,7 +90,7 @@ class DBBuilder:
             pass # Collection didn't exist
             
         self.collection = self.client.get_or_create_collection(name=self.config["database"]["collection_name"], embedding_function=self.embeddings)
-        self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=400)
+        self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=300)
 
     def load_owasp(self):
         """Load OWASP cheat sheets using requests + BeautifulSoup for proper HTML cleaning"""
@@ -471,7 +471,7 @@ class DBBuilder:
             print("No documents loaded. Exiting.")
             return
 
-        # Smart chunking: CVEs are atomic, don't split them
+        
         all_chunks = []
         all_chunks.extend(cve_docs)  # CVEs: Add as-is (already self-contained)
         

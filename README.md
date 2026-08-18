@@ -125,14 +125,18 @@ streamlit run app.py
 
 ---
 
+## 🔒 Security & Privacy Guarantees
 
+- **No API Keys:** Runs 100% locally via Ollama. No cloud provider accounts required.
+- **Strict Amnesia Prompts:** The System Prompt aggressively forces the LLM to deny answers if the exact mitigation is not listed in the retrieved contexts, ensuring zero hallucinations.
+- **Localhost Bound:** The FastAPI backend is bound solely to `127.0.0.1`, safely isolated from your exposed network.
+- **Input Sanitization:** Guardrails drop known prompt injection vectors (`"Ignore previous instructions"`).
 
 ---
 
 <div align="center">
 
-
-
+Built with ❤️ for the security community.
 *SecRAG — Defending systems through rigorous, verifiable intelligence.*
 
 </div>

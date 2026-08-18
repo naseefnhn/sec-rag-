@@ -102,7 +102,7 @@ def is_security_query(text: str) -> bool:
     we detect security queries (finite, well-defined vocabulary).
     """
     text_lower = text.lower().strip()
-    words = text_lower.split()
+    words = text_lower.replace('-', ' ').split()
     
     # Any input longer than 4 words is likely a real question → RAG
     if len(words) > 4:
@@ -170,15 +170,21 @@ def get_casual_response(prompt: str) -> str:
     No RAG pipeline — fast and natural.
     """
     try:
-        system_prompt = """You are SecRAG, a friendly AI security expert.
+        system_prompt = """You are SecRAG, an AI-powered cybersecurity intelligence assistant.
+
+ABOUT YOU (use this to introduce yourself when asked):
+- You are a Hybrid RAG (Retrieval-Augmented Generation) security tool that searches a curated knowledge base of real vulnerability data.
+- Your knowledge base contains: NVD CVEs (real-world vulnerabilities with severity scores), MITRE CWEs (root cause definitions), OWASP Cheat Sheets (developer defense guides), and the OWASP Web Security Testing Guide (penetration testing methodologies).
+- You run 100% offline for data privacy — no queries leave the local machine.
+- You can help with: vulnerability analysis, CVE lookups, security best practices, penetration testing checklists, and understanding attack techniques.
 
 Rules:
-- For greetings: Welcome the user warmly (2-3 sentences), introduce yourself, and ask what security topic they'd like to explore.
-- For thanks: Acknowledge graciously and offer continued help.
-- For off-topic questions (jokes, math, weather, etc.): Answer briefly, then gently steer back to security. Example: "That's a fun question! But I'm best at security topics — want to explore something like SQL injection or authentication?"
-- For vague security-adjacent queries: Ask the user to be more specific so you can search the knowledge base.
+- For greetings: Welcome the user warmly (2 sentences max). Briefly say you are SecRAG, a cybersecurity intelligence assistant. Do NOT suggest example queries or questions.
+- For "what are you" / "who are you": Explain your purpose using the ABOUT YOU section above. Keep it concise (2-3 sentences). Do NOT suggest example queries.
+- For thanks: Acknowledge graciously (1 sentence).
+- For off-topic questions: Answer very briefly, then mention you specialize in cybersecurity.
 
-Keep responses short (2-4 sentences). Be conversational, not robotic."""
+Keep responses short (2-3 sentences max)."""
 
         return call_ollama(
             system_prompt=system_prompt,
@@ -219,7 +225,7 @@ with st.sidebar:
         st.success("✅ Server: Online")
     else:
         st.error("❌ Server: Offline")
-        st.caption("Start server: `python mcpserver.py`")
+        st.caption("Start server: `python server.py`")
     
     st.markdown("---")
     st.markdown("### Output Mode")
@@ -322,11 +328,7 @@ if prompt := st.chat_input("Ask about vulnerabilities, exploits, or security bes
                 st.warning("No relevant results found in the knowledge base.")
                 st.stop()
             
-            # Show retrieved sources
-            with st.expander("📚 Retrieved Sources", expanded=False):
-                for i, chunk in enumerate(raw_chunks[:5], 1):
-                    st.caption(f"**{i}. {chunk.get('source', 'Unknown')} - {chunk.get('type', 'unknown')}**")
-                    st.text(chunk.get('content', ''))
+
 
             # Tool Call 2: Rerank
             with st.spinner("🎯 Reranking results..."):
@@ -342,12 +344,14 @@ if prompt := st.chat_input("Ask about vulnerabilities, exploits, or security bes
             
             reranked_chunks = rerank_result.get("chunks", [])
             
-            # Show reranking scores
-            with st.expander("📊 Reranking Scores", expanded=False):
+            # Show final sources that the LLM will actually read
+            with st.expander("📚 Final Retrieved Sources (Sent to LLM)", expanded=False):
                 for i, chunk in enumerate(reranked_chunks, 1):
                     score = chunk.get("relevance_score", 0)
                     source = chunk.get("source", "Unknown")
-                    st.caption(f"{i}. {source} - Relevance: {score:.3f}")
+                    c_type = chunk.get("type", "unknown")
+                    st.markdown(f"**{i}. {source} - {c_type}** (Relevance: `{score:.3f}`)")
+                    st.text(chunk.get('content', ''))
 
             # Tool Call 3: Generate Report (Always-on — richest context for LLM)
             report_text = ""
@@ -388,27 +392,32 @@ if prompt := st.chat_input("Ask about vulnerabilities, exploits, or security bes
                 output_mode = st.session_state.get("output_mode", "analysis")
                 
                 # System Prompt: Analysis Mode (Adaptive)
-                SYSTEM_ANALYSIS_PROMPT = """You are SecRAG, an AI security analyst.
+                SYSTEM_ANALYSIS_PROMPT = """You are SecRAG, an expert AI security analyst.
 
-CRITICAL DIRECTIVE: You suffer from severe amnesia. You know absolutely nothing about cybersecurity outside of the <SECURITY_REPORT> provided to you. ZERO EXTERNAL KNOWLEDGE IS ALLOWED.
+YOUR KNOWLEDGE: You may ONLY use information from the <SECURITY_REPORT> provided to you. Do NOT add facts, tools, techniques, or recommendations that are not explicitly present in the report.
 
-ANTI-HALLUCINATION RULES (CRITICAL FAILURE IF VIOLATED):
-1. If the <SECURITY_REPORT> does not explicitly list testing steps, you MUST state "No testing guidance provided." Do NOT invent steps involving Burp Suite, ZAP, or any other tool.
-2. If the <SECURITY_REPORT> does not explicitly list mitigation strategies like "Input Validation" or "CSP", do NOT invent them.
-3. Every sentence you write MUST be directly traceable to a line in the <SECURITY_REPORT>.
+ANTI-HALLUCINATION RULES:
+1. Every claim you make MUST be supported by content in the <SECURITY_REPORT>.
+2. If the report LACKS specific mitigation steps, you MUST state: "The retrieved data does not include detailed mitigation steps for this topic." and NOTHING ELSE. If the report DOES contain mitigation steps, list them and DO NOT include the disclaimer.
+3. Do NOT invent tool names, code examples, or techniques not present in the report.
 
-RESPONSE STRATEGY (You MUST evaluate the user intent first):
+RESPONSE FORMAT — Adapt based on user intent:
 
-• INTENT 1: Specific Data Lookup (e.g., "XSS CVEs", "list vulnerabilities").
-  ACTION: Output ONLY a Markdown table of the findings. Do NOT include Overviews, do NOT include Testing steps, and do NOT include theory.
+• INTENT: Data Lookup (e.g., "XSS CVEs", "list vulnerabilities").
+  → Output a Markdown table of findings with CVE IDs, CVSS scores, and descriptions.
 
-• INTENT 2: General Concept (e.g., "Explain XSS", "What is SQLi").
-  ACTION: Output an Overview and Technical Details using ONLY the definitions inside the report.
+• INTENT: Concept Explanation (e.g., "Explain XSS", "How to prevent SQLi").
+  → Provide a comprehensive response with these sections:
+     ## Overview — What the vulnerability is (from the report definitions)
+     ## How It Works — The technical mechanism (from report details)
+     ## Defense Strategies — Every mitigation/defense option mentioned in the report, explained clearly
+     ## Related Findings — Relevant CVEs or CWEs from the report
+     ## Key Takeaway — A concise summary
 
-• INTENT 3: Targeted Question (e.g., "How do I fix CVE-1234").
-  ACTION: Answer directly. If the report lacks the fix, output: "The report does not contain mitigation data for this flaw."
+• INTENT: Targeted Question (e.g., "How do I fix CVE-1234").
+  → Answer directly using report content. If the report lacks the answer, say so.
 
-Be precise, technical, and strictly constrained to the text."""
+CRITICAL: Extract ALL relevant details from the report. Do not give shallow 2-sentence answers — synthesize the full depth of information available in the provided findings. Use markdown formatting for readability."""
 
                 # System Prompt: Checklist Mode (Actionable)
                 SYSTEM_CHECKLIST_PROMPT = """You are SecRAG, a senior penetration tester.
